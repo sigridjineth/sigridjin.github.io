@@ -1,0 +1,293 @@
+---
+title: "Code Review: Two Implementations of Bayesian BM25"
+date: "2026-02-16"
+tags: ["search", "bayesian", "bm25", "rust", "python"]
+summary: "A side-by-side reading of two Bayesian BM25 implementations — cognica-io/bayesian-bm25 and instructkr/bb25 — and what one learned from the other."
+---
+
+## Background
+
+In early 2025, Jaepil Jeong published a paper on Bayesian BM25. The idea: apply Bayes' theorem to BM25 scores so they become proper probabilities, opening a mathematically grounded path to merging lexical and vector signals in hybrid search. Some have called it the first rigorous closure of Robertson's 1977 Probability Ranking Principle—fifty years of loose ends, tied up in a single formulation.
+
+Two Python implementations came out of that work. Previously, I built the Rust-based implementation called [instructkr/bb25](https://github.com/instructkr/bb25) (InstructKR for short). Then the paper's author Jaepil re-wrote the implementation with a dedicated repository, [cognica-io/bayesian-bm25](https://github.com/cognica-io/bayesian-bm25) (Cognica for short). Both start from the same equations, but the codebases diverge quite a bit once you open them up. This article is a side-by-side reading of the two, and a record of what InstructKR learned from Cognica along the way.
+
+## Overall Structure
+
+Cognica ships four files. `probability.py` handles the probability transform, `scorer.py` bridges with the bm25s library, and `fusion.py` collects the probability combination functions. Including the init file, the total comes to roughly 450 lines. It depends only on NumPy, and the search engine itself (bm25s) is an optional install.
+
+InstructKR has eleven Python files plus a separate Rust implementation. It builds everything from scratch: tokenizer, corpus, inverted index, BM25 scorer, Bayesian scorer, vector scorer, hybrid scorer, parameter learner, and experiment runner. No external packages needed. Run `python -m bayesian_bm25.run_experiments` and all ten of the paper's claims get verified on the spot.
+
+The intent behind each project is different. Cognica is a thin conversion layer you drop on top of an existing search system. InstructKR is a ground-up experimental environment that reconstructs the paper's entire pipeline. That difference in intent leaves its mark on every algorithmic choice.
+
+## Algorithmic Differences
+
+### Document Length Normalization Prior
+
+Same function name, different math. This is the most visible divergence between the two.
+
+Cognica follows the paper's Eq. 26 directly: `0.3 + 0.6 * (1 - min(1, |ratio - 0.5| * 2))`, where `doc_len_ratio` is the document length divided by the corpus average. The function peaks at 0.9 when the ratio is 0.5 and drops symmetrically on both sides. At ratio 0 and ratio 1 alike, the prior settles at 0.3. Very short documents and very long documents both get penalized equally.
+
+InstructKR originally used `1 / (1 + ratio)` with a clamp to [0.1, 0.9]. This is a monotonically decreasing function, so shorter documents always received a higher prior. At ratio 0 the prior was 0.9, at ratio 1 it was 0.5, at ratio 2 about 0.33.
+
+In practice, this gap matters. Under the old InstructKR formula, a three-word document containing just one query term still got a strong prior. Under Cognica, extremely short documents take a penalty too. Measured against the paper's original formula, Cognica matches the author's intent.
+
+### Multi-Term Score Combination
+
+When a query contains multiple words, how do you collapse them into a single probability? This is where the two projects' philosophies split.
+
+Cognica takes the final score that bm25s computes—already aggregated across terms—and maps that one number to a probability via `score_to_probability`. It never touches the internal IDF weighting or term frequency saturation logic.
+
+InstructKR calculates a separate BM25 score for each query term, converts each one to a Bayesian posterior individually, then combines them through noisy-OR: `P = 1 - ∏(1 - p_i)`. This computes the probability that at least one term is relevant.
+
+The ranking implications are direct. In Cognica's pipeline, the sigmoid and the Bayesian posterior are both monotonically increasing. BM25 rank order survives the probability conversion intact—if BM25(A) > BM25(B), then P(A) > P(B), guaranteed. That preservation is one of the paper's proven properties.
+
+InstructKR can break that order. Per-term decomposition followed by noisy-OR recombination sometimes reranks documents. Consider a "machine learning" query where document A scores high on "machine" but low on "learning." Its BM25 sum might be high, but under noisy-OR, document B—with moderate scores on both terms—can climb past it. Noisy-OR favors balanced coverage over lopsided strength.
+
+Which approach is better depends on what you want. If you need bit-for-bit BM25 rank preservation with a probabilistic interpretation layered on top, Cognica. If term-level probability composition as an experimental direction interests you, InstructKR.
+
+### Probability Conjunction and Shrinkage
+
+When you AND two probabilities in a hybrid search setup, multiplying 0.9 by 0.9 gives you 0.81. Three signals: 0.729. The combined probability shrinks as you add more signals, even when every system agrees a document is relevant. That's counterintuitive, and it's called shrinkage.
+
+InstructKR's Python code originally used plain multiplication: `P(A) · P(B)`.
+
+Cognica addresses the problem through log-odds conjunction. It takes the geometric mean of the input probabilities, lifts them into log-odds space via the logit function, adds an agreement bonus of `α · ln(n)` (where n is the number of signals and α controls bonus strength), then maps back to probability space with a sigmoid.
+
+Numbers make the difference concrete. For inputs [0.9, 0.9], plain multiplication yields 0.810; log-odds conjunction yields 0.927. For [0.7, 0.7], it's 0.490 versus 0.770. When signals disagree—[0.7, 0.3]—log-odds conjunction settles around 0.54, hovering near 0.5 to reflect genuine uncertainty. Agreement amplifies; disagreement pulls toward ambiguity.
+
+One interesting wrinkle I noticed in my own codebase: the Python `HybridScorer.probabilistic_and` used simple multiplication, but the Rust function with the same name already followed the geometric-mean → logit → agreement-bonus → sigmoid sequence—structurally identical to Cognica's `log_odds_conjunction`. I had upgraded the algorithm during the Rust port without backporting it to the Python side.
+
+### Online Learning
+
+Cognica's `BayesianProbabilityTransform` offers two learning paths: `fit()` for batch learning and `update()` for online learning that refreshes alpha and beta one observation at a time. Inside `update()`, five stabilization mechanisms are at work: gradient EMA smoothing, Adam-style bias correction, gradient norm clipping, learning rate decay, and Polyak averaging. These are production-facing features, designed for scenarios like incorporating real-time user click feedback.
+
+InstructKR's `ParameterLearner` originally ran basic batch gradient descent only. No momentum, no clipping—tuned for reproducing the paper's convergence experiments and nothing more.
+
+Cognica's benchmark code also includes an online learning convergence test on BEIR datasets (NFCorpus, SciFact). It incrementally feeds queries from 0 to 75, tracking NDCG@10 and ECE at each step.
+
+### Automatic Parameter Estimation
+
+Where the sigmoid's alpha (slope) and beta (midpoint) come from is another point of divergence.
+
+At indexing time, Cognica samples 50 documents from the corpus and uses the first 5 tokens of each as pseudo-queries to build a BM25 score distribution. Beta is set to the median score, alpha to the inverse of the standard deviation. This pins sigmoid 0.5 to the median and lets the slope self-adjust to the score distribution's spread.
+
+InstructKR originally had no such automatic estimation. You either accepted the defaults (alpha=1.0, beta=0.5) or set them manually.
+
+### Vectorization
+
+Every math function in Cognica operates on NumPy arrays. Probabilities for 10,000 documents are computed in a single pass. InstructKR's Python code is scalar-based, using `math.exp` and looping over documents one by one. The project compensates for this with its Rust implementation and PyO3 bindings.
+
+## InstructKR's Strength: The Experiment Framework
+
+For paper verification, InstructKR is clearly ahead. `ExperimentRunner` contains 10 experiments, each mapping one-to-one to a Definition or Theorem in the paper. One checks whether two formulations of BM25 agree within floating-point tolerance. Another confirms that all Bayesian outputs fall in [0, 1] while BM25 rank order is preserved. Others verify TF-to-Bayesian-score monotonicity, the composite prior's [0.1, 0.9] range guarantee, and numerical stability at extreme probability values (from 10⁻¹⁵ to 1 − 10⁻¹⁰).
+
+The experiments run on a compact corpus of 20 documents across 4 clusters with 7 queries. All 10 pass. Each function carries a paper reference in its comments—"Definition 4.1.1," "Theorem 5.1.1," and so on—which makes reading code alongside the paper straightforward. The zero-dependency design is a real advantage for educational use.
+
+Cognica takes a different approach to testing. Three pytest-based unit tests verify mathematical properties at the function level, and a separate benchmark suite measures NDCG@10, MAP, and ECE on BEIR datasets. It's function-level rigor rather than full-paper-in-one-shot verification.
+
+## Formula Alignment
+
+The likelihood function `σ(α(s−β))`, the TF prior `0.2 + 0.7 * min(1, tf/10)`, the composite prior's weighted sum `0.7 * P_tf + 0.3 * P_norm`, the [0.1, 0.9] clamping range, and the Bayesian posterior `L·p / (L·p + (1−L)·(1−p))`—these are identical in both codebases.
+
+Three things differed before the v0.2.0 update: the norm prior formula (Cognica uses a symmetric bell shape, InstructKR used monotonic decay), multi-term combination (Cognica transforms the aggregate score, InstructKR uses per-term posteriors with noisy-OR), and probability AND (Cognica uses log-odds conjunction, InstructKR Python used simple multiplication while InstructKR Rust already used log-odds conjunction).
+
+## Choosing Between Them
+
+If you need to convert an existing search system's scores into probabilities, Cognica fits. One pip install, mathematically guaranteed rank preservation, automatic parameter estimation that works without manual tuning, and log-odds conjunction to handle hybrid search shrinkage.
+
+If you want to trace the paper's math from the ground up, InstructKR is the better pick. The full pipeline lives in one project with no external dependencies, ten experiments correspond directly to the paper's theorems, and the Rust port shows a clear optimization path.
+
+Using both together is worth considering too. Build your production pipeline on Cognica, but borrow InstructKR's experiment framework to independently verify rank preservation, prior bounds, and numerical stability on your own corpus.
+
+## The Broader Story the Paper Opens
+
+One formula from the reference material is particularly striking: `P(R=1|s) = σ(Σ wᵢ · ln Pᵢ + α ln n)`. Expand the Bayesian posterior this way and you're looking at an artificial neuron. `Σ wᵢ · ln Pᵢ` is the weighted-sum input, `α ln n` is the bias term, and σ is the activation function.
+
+A second paper, "From Bayesian Inference to Neural Computation," explores this connection in depth. Sigmoid emerges from the Bayesian posterior for binary relevance. ReLU comes from MAP estimation under a sparse non-negative prior. Softmax is the canonical link function for the categorical exponential family. Attention drops out of a Logarithmic Opinion Pool with context-dependent confidence weights. Probabilistic derivations for GELU and Swish have reportedly been completed recently as well.
+
+Follow one fifty-year-old search algorithm far enough, and you end up at the mathematical roots of neural network architecture. That's why this paper's reach extends well beyond search.
+
+## InstructKR v0.2.0 Update Log: Lessons Borrowed from Cognica
+
+Based on the analysis above, four proven patterns from Cognica have been ported into the InstructKR codebase. Each change was applied only after confirming that all 10 experiments still pass.
+
+### norm_prior Formula Fix (Python + Rust)
+
+This is the most important change. The old monotonically decreasing `1 / (1 + ratio)` has been replaced with the symmetric bell curve from the paper's Eq. 26: `0.3 + 0.6 * (1 - min(1, |ratio - 0.5| * 2))`.
+
+```python
+# Before (original InstructKR)
+ratio = doc_length / avg_doc_length
+prior = 1.0 / (1.0 + ratio)
+return clamp(prior, 0.1, 0.9)
+
+# After (paper Eq. 26)
+ratio = doc_length / avg_doc_length
+return 0.3 + 0.6 * (1.0 - min(1.0, abs(ratio - 0.5) * 2.0))
+```
+
+At ratio=0 the prior moves from 0.90 to 0.30; at ratio=0.5 it goes from 0.67 to 0.90. The old bias—unconditionally boosting extremely short documents—is gone. Documents near half the average length now receive the strongest prior, which is what the paper originally intended. The Rust implementation (`bayesian_bm25_rs/src/bayesian_scorer.rs`) was updated identically.
+
+Experiment outputs show the prior range shifting from [0.3146, 0.4126] to [0.2790, 0.3770], but every value still falls within the theoretical [0.1, 0.9] bounds and all 10 experiments pass.
+
+### log_odds_conjunction Added
+
+A `log_odds_conjunction()` method has been added to the Python `HybridScorer`. The naive product AND (`P(A) · P(B)`) previously used by `score_and()` is now replaced with log-odds conjunction.
+
+```python
+# New method in hybrid_scorer.py
+def log_odds_conjunction(self, probs):
+    geo_mean = math.exp(log_sum / n)
+    l_adjusted = logit(geo_mean) + self.alpha * math.log(n)
+    return sigmoid(l_adjusted)
+```
+
+Alongside this, a `logit()` function was added to `math_utils.py` and registered in `__init__.py`. `HybridScorer` also gained an `alpha` parameter (default 0.5).
+
+The old `probabilistic_and()` remains in place—experiments 6 and 10 (intersection range verification) still rely on it. Experiment 7 now includes `hybrid_conjunction` results as well, so you can compare naive sum, RRF, probabilistic OR, and log-odds conjunction rankings side by side.
+
+With this change, both the Python and Rust `HybridScorer` implementations use log-odds conjunction, closing the algorithmic gap between the two.
+
+### Automatic Parameter Estimation
+
+An `estimate_parameters()` method has been added to `BayesianBM25Scorer`.
+
+```python
+# Usage
+scorer = BayesianBM25Scorer(bm25, auto_estimate=True)
+# or
+scorer = BayesianBM25Scorer(bm25)
+scorer.estimate_parameters()
+```
+
+It samples up to 50 documents from the corpus, uses the first 5 tokens of each as pseudo-queries, and collects the resulting BM25 score distribution. Beta is set to the score median (the sigmoid's midpoint), and alpha to the inverse of the standard deviation (scaling the slope to match the distribution's spread). This mirrors Cognica's `_estimate_parameters` approach exactly.
+
+When the defaults of `alpha=1.0, beta=0.5` don't suit your corpus, this gives you reasonable parameters without any labeled data.
+
+### Online Learning
+
+A new `update()` method on `ParameterLearner` supports single-observation and mini-batch online learning. All five of Cognica's stabilization techniques are implemented: EMA gradient smoothing to reduce gradient noise, Adam-style bias correction for the early updates, gradient norm clipping to prevent parameter blowup on imbalanced batches, learning rate decay via `lr / (1 + t/τ)`, and Polyak averaging for stable inference-time parameters.
+
+```python
+learner = ParameterLearner(learning_rate=0.01)
+alpha, beta = 1.0, 0.0
+
+# Online updates
+for score, label in feedback_stream:
+    alpha, beta = learner.update([score], [label], alpha, beta)
+
+# Stable parameters for inference
+stable_alpha = learner.averaged_alpha
+stable_beta = learner.averaged_beta
+```
+
+The existing `learn()` batch method is unchanged, so nothing breaks for current users. A `reset_online_state()` method is also available to reinitialize the EMA and Polyak state.
+
+### Post-Update Verification
+
+```
+All 10 experiments PASSED.
+```
+
+After all four changes, every experiment passes. The norm_prior update shifts some prior values, but the core properties—theoretical bounds, monotonicity, rank preservation—hold.
+
+## Use bb25 Today
+
+bb25 installs with pip and exposes a single `bb25` import. Four snippets cover the main use cases.
+
+### Built-in Corpus and Queries
+
+The package ships with a small default corpus (20 documents, 4 clusters) and 7 queries so you can start experimenting without preparing any data.
+
+```python
+import bb25 as bb
+
+corpus = bb.build_default_corpus()
+docs = corpus.documents()
+queries = bb.build_default_queries()
+
+bm25 = bb.BM25Scorer(corpus, 1.2, 0.75)
+score = bm25.score(queries[0].terms, docs[0])
+print("score0", score)
+```
+
+### Custom Corpus
+
+If you want to work with your own documents, create a `Corpus`, add documents with text and optional embedding vectors, then call `build_index()` before creating any scorer.
+
+```python
+import bb25 as bb
+
+corpus = bb.Corpus()
+corpus.add_document("d1", "neural networks for ranking", [0.1] * 8)
+corpus.add_document("d2", "bm25 is a strong baseline", [0.2] * 8)
+corpus.build_index()  # must be called before creating scorers
+
+bm25 = bb.BM25Scorer(corpus, 1.2, 0.75)
+print(bm25.idf("bm25"))
+```
+
+### Bayesian Calibration and Hybrid Fusion
+
+Stack the scorers: `BM25Scorer` feeds into `BayesianBM25Scorer` for probability calibration, then `HybridScorer` combines the Bayesian lexical signal with a vector signal. `score_or` gives the probability that either signal indicates relevance; `score_and` gives the probability that both do, using log-odds conjunction.
+
+```python
+import bb25 as bb
+
+corpus = bb.build_default_corpus()
+docs = corpus.documents()
+queries = bb.build_default_queries()
+
+bm25 = bb.BM25Scorer(corpus, 1.2, 0.75)
+bayes = bb.BayesianBM25Scorer(bm25, 1.0, 0.5)
+vector = bb.VectorScorer()
+hybrid = bb.HybridScorer(bayes, vector)
+
+q = queries[0]
+prob_or = hybrid.score_or(q.terms, q.embedding, docs[0])
+prob_and = hybrid.score_and(q.terms, q.embedding, docs[0])
+print("OR", prob_or, "AND", prob_and)
+```
+
+### Run All Experiments
+
+One call runs the full suite of 10 experiments that verify the paper's theorems and definitions against the built-in corpus.
+
+```python
+import bb25 as bb
+
+results = bb.run_experiments()
+print(all(r.passed for r in results))
+```
+
+### End-to-End Example
+
+Putting it all together—BM25 raw score, Bayesian posterior, and both hybrid fusion modes for a single query-document pair:
+
+```python
+import bb25 as bb
+
+
+def main() -> None:
+    corpus = bb.build_default_corpus()
+    docs = corpus.documents()
+    queries = bb.build_default_queries()
+
+    bm25 = bb.BM25Scorer(corpus, 1.2, 0.75)
+    bayes = bb.BayesianBM25Scorer(bm25, 1.0, 0.5)
+    vector = bb.VectorScorer()
+    hybrid = bb.HybridScorer(bayes, vector)
+
+    q = queries[0]
+    doc = docs[0]
+
+    print("query:", q.text)
+    print("bm25:", bm25.score(q.terms, doc))
+    print("bayes:", bayes.score(q.terms, doc))
+    print("or:", hybrid.score_or(q.terms, q.embedding, doc))
+    print("and:", hybrid.score_and(q.terms, q.embedding, doc))
+
+
+if __name__ == "__main__":
+    main()
+```
